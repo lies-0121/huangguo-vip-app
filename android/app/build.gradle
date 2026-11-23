@@ -5,6 +5,41 @@ plugins {
     id "dev.flutter.flutter-gradle-plugin"
 }
 
+// ---------------------------------------------------------------------------
+// 签名策略
+// 仓库里同时存在 android/key.properties 与 android/app/huangguo.jks 时，用这把
+// 固定的 key 签 release 包；否则退回 debug key，任何情况下都能编出可安装的 APK。
+//
+// 为什么要固定：debug key 每次构建都会重新生成，签名指纹不同，手机上想装新版本
+// 就得先卸载旧版，观看进度（SharedPreferences）跟着一起没。固定后可直接覆盖安装。
+//
+// 想启用：跑一次仓库里的 Generate signing keystore 工作流，把产物按原路径提交
+// 进仓库即可，本文件不需要再改。
+// ---------------------------------------------------------------------------
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file("key.properties")
+def hasReleaseKey = false
+def releaseStoreFile = null
+def releaseKeyAlias = null
+def releaseKeyPassword = null
+def releaseStorePassword = null
+
+if (keystorePropertiesFile.exists()) {
+    keystorePropertiesFile.withReader("UTF-8") { reader ->
+        keystoreProperties.load(reader)
+    }
+    def storeName = keystoreProperties.getProperty("storeFile")
+    if (storeName == null || storeName.trim().isEmpty()) {
+        storeName = "huangguo.jks"
+    }
+    // file() 以 android/app 为基准目录
+    releaseStoreFile = file(storeName)
+    hasReleaseKey = releaseStoreFile.exists()
+    releaseKeyAlias = keystoreProperties.getProperty("keyAlias")
+    releaseKeyPassword = keystoreProperties.getProperty("keyPassword")
+    releaseStorePassword = keystoreProperties.getProperty("storePassword")
+}
+
 android {
     namespace = "com.huangguo.huangguo_vip"
     compileSdk = flutter.compileSdkVersion
@@ -20,21 +55,27 @@ android {
     }
 
     defaultConfig {
-        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = "com.huangguo.huangguo_vip"
-        // You can update the following values to match your application needs.
-        // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }
 
+    signingConfigs {
+        if (hasReleaseKey) {
+            release {
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+                storeFile = releaseStoreFile
+                storePassword = releaseStorePassword
+            }
+        }
+    }
+
     buildTypes {
         release {
-            // TODO: Add your own signing config for the release build.
-            // Signing with the debug keys for now, so `flutter run --release` works.
-            signingConfig = signingConfigs.debug
+            signingConfig = hasReleaseKey ? signingConfigs.release : signingConfigs.debug
         }
     }
 }
