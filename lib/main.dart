@@ -1,9 +1,13 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
+import 'package:media_kit/media_kit.dart';
+import 'package:media_kit_video/media_kit_video.dart';
+import 'package:pointycastle/export.dart' as pc;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 import 'package:webview_flutter/webview_flutter.dart';
@@ -60,7 +64,7 @@ const String kUserAgent =
     '(KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1';
 
 const int kHttpTimeout = 12;
-const String kAppVer = 'v1.1d';
+const String kAppVer = 'v1.2a';
 
 int intOf(dynamic v, [int fallback = 0]) {
   if (v is int) return v;
@@ -128,7 +132,85 @@ class LenientHttpOverrides extends HttpOverrides {
   }
 }
 
-/// 封面图请求头：部分 CDN 会检查 Referer。
+/// 封面图是 AES-128-CBC 加密的二进制，协议在站点 crypto-image-protocol.js 里公开：
+///   window.CryptoImageProtocol = { decryptKey: 'f5d965df75336270', decryptIV: '97b60394abc2fbe1' }
+/// 直接 HTTP 拿到的不是 JPEG（首字节随机），浏览器也要先解密再塞 blob，所以
+/// Image.network 必然报 Invalid image data。这里按同一协议解出明文再渲染。
+const String kImgKey = 'f5d965df75336270';
+const String kImgIv = '97b60394abc2fbe1';
+
+final Map<String, Uint8List> _coverCache = <String, Uint8List>{};
+
+/// 判断下载到的是不是已经解密的图片。
+bool looksLikeImage(Uint8List b) {
+  if (b.length < 12) return false;
+  if (b[0] == 0xFF && b[1] == 0xD8) return true; // jpeg
+  if (b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47) return true; // png
+  if (b[0] == 0x47 && b[1] == 0x49 && b[2] == 0x46) return true; // gif
+  if (b[0] == 0x52 && b[1] == 0x49 && b[2] == 0x46 && b[3] == 0x46) return true; // riff/webp
+  if (b[4] == 0x66 && b[5] == 0x74 && b[6] == 0x79 && b[7] == 0x70) return true; // ftyp/heif
+  if (b[0] == 0x42 && b[1] == 0x4D) return true; // bmp
+  return false;
+}
+
+/// AES-128-CBC + PKCS7 解密；密钥与 IV 都是 16 个 ASCII 字符。
+Uint8List aesDecrypt(Uint8List data) {
+  try {
+    final int len = data.length - (data.length % 16);
+    if (len <= 0) return data;
+    final Uint8List key = Uint8List.fromList(kImgKey.codeUnits);
+    final Uint8List iv = Uint8List.fromList(kImgIv.codeUnits);
+    final pc.CBCBlockCipher cipher = pc.CBCBlockCipher(pc.AESEngine());
+    cipher.init(
+      false,
+      pc.ParametersWithIV<pc.KeyParameter>(pc.KeyParameter(key), iv),
+    );
+    final Uint8List out = Uint8List(len);
+    for (int off = 0; off < len; off += 16) {
+      cipher.processBlock(data, off, out, off);
+    }
+    int pad = out[len - 1];
+    if (pad < 1 || pad > 16) pad = 0;
+    if (pad > len) pad = 0;
+    return Uint8List.sublistView(out, 0, len - pad);
+  } catch (_) {
+    return data;
+  }
+}
+
+/// 拉一张封面：直连 -> 识别 -> 需要时解密 -> 内存缓存。
+Future<Uint8List?> fetchCover(String url) async {
+  if (url.isEmpty) return null;
+  final Uint8List? hit = _coverCache[url];
+  if (hit != null) return hit;
+  final String u = url.startsWith('http') ? url : gBase + url;
+  try {
+    final HttpClient client = HttpClient();
+    client.connectionTimeout = const Duration(seconds: kHttpTimeout);
+    final HttpClientRequest req = await client.getUrl(Uri.parse(u));
+    req.headers.set('User-Agent', kUserAgent);
+    req.headers.set('Referer', gBase + '/');
+    final HttpClientResponse res = await req.close();
+    if (res.statusCode != 200) {
+      client.close();
+      return null;
+    }
+    final List<int> buf = <int>[];
+    await for (final List<int> chunk in res) {
+      buf.addAll(chunk);
+    }
+    client.close();
+    Uint8List bytes = Uint8List.fromList(buf);
+    if (bytes.isEmpty) return null;
+    if (!looksLikeImage(bytes)) bytes = aesDecrypt(bytes);
+    if (bytes.isEmpty) return null;
+    if (_coverCache.length > 150) _coverCache.clear();
+    _coverCache[url] = bytes;
+    return bytes;
+  } catch (_) {
+    return null;
+  }
+}
 
 class CoverImage extends StatefulWidget {
   const CoverImage({
@@ -149,74 +231,56 @@ class CoverImage extends StatefulWidget {
 }
 
 class CoverImageState extends State<CoverImage> {
-  String _url = '';
-  bool _switched = false;
-  String _err = '';
+  Future<Uint8List?>? _fut;
 
   @override
   void initState() {
     super.initState();
-    _url = widget.url;
+    _fut = fetchCover(widget.url);
   }
 
   @override
   void didUpdateWidget(CoverImage old) {
     super.didUpdateWidget(old);
     if (old.url != widget.url) {
-      _url = widget.url;
-      _switched = false;
-      _err = '';
+      _fut = fetchCover(widget.url);
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_url.isEmpty) {
-      return Container(
-        color: Colors.grey[850],
-        child: Center(child: widget.placeholder ?? const Icon(Icons.movie)),
-      );
-    }
-    return Image.network(
-      _url,
-      width: widget.width ?? double.infinity,
-      fit: widget.fit,
-      headers: imgHeaders(),
-      errorBuilder: (BuildContext c, Object e, StackTrace? s) {
-        if (!_switched && _url.startsWith('https://')) {
-          _switched = true;
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (mounted) {
-              setState(() {
-                _url = 'http://' + _url.substring(8);
-              });
-            }
-          });
-          return Container(color: Colors.grey[850]);
+    return FutureBuilder<Uint8List?>(
+      future: _fut,
+      builder: (BuildContext c, AsyncSnapshot<Uint8List?> s) {
+        final Uint8List? b = s.data;
+        if (b != null && b.isNotEmpty) {
+          return Image.memory(
+            b,
+            width: widget.width ?? double.infinity,
+            fit: widget.fit,
+            gaplessPlayback: true,
+            errorBuilder: (BuildContext c2, Object e, StackTrace? st) {
+              return Container(
+                color: Colors.grey[850],
+                child: Center(
+                  child: widget.placeholder ?? const Icon(Icons.movie),
+                ),
+              );
+            },
+          );
         }
-        final String msg = e.toString();
-        final int cut = msg.indexOf('\n');
-        final String short = cut > 0 ? msg.substring(0, cut) : msg;
-        if (_err != short) {
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (mounted && _err != short) {
-              setState(() {
-                _err = short;
-              });
-            }
-          });
-        }
+        final bool done = s.connectionState == ConnectionState.done;
         return Container(
           color: Colors.grey[850],
-          padding: const EdgeInsets.all(4),
           child: Center(
-            child: Text(
-              _err.isEmpty ? '封面加载失败' : _err,
-              maxLines: 4,
-              overflow: TextOverflow.ellipsis,
-              textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 8, color: Colors.white70),
-            ),
+            child: done
+                ? (widget.placeholder ??
+                    const Icon(Icons.movie, color: Colors.white38))
+                : const SizedBox(
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
           ),
         );
       },
@@ -233,6 +297,7 @@ Map<String, String> imgHeaders() {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  MediaKit.ensureInitialized();
   HttpOverrides.global = LenientHttpOverrides();
   await loadBaseOverride();
   runApp(const HuangguoVIPApp());
@@ -942,6 +1007,8 @@ class _PlayerPageState extends State<PlayerPage> {
 
   late final WebViewController _web;
   VideoPlayerController? _video;
+  Player? _mp;
+  VideoController? _vc;
   PlayMode _mode = PlayMode.resolving;
   bool _resolved = false;
   String? _hint;
@@ -1125,7 +1192,64 @@ class _PlayerPageState extends State<PlayerPage> {
     }
   }
 
+  /// 优先用 libmpv 播（软解 HEVC，规避 ExoPlayer 在部分机型上的
+  /// MediaCodecVideoRenderer 失败），拿不到画面再退回系统播放器。
   Future<void> _playNative(String url) async {
+    final bool ok = await _playMpv(url);
+    if (ok) return;
+    await _playNativeVp(url);
+  }
+
+  Future<bool> _playMpv(String url) async {
+    Player? p;
+    try {
+      p = Player();
+      final VideoController c = VideoController(p);
+      await p.open(
+        Media(
+          url,
+          httpHeaders: <String, String>{
+            'User-Agent': kUserAgent,
+            'Referer': gBase + '/',
+          },
+        ),
+        play: true,
+      );
+      final Stopwatch sw = Stopwatch()..start();
+      while (sw.elapsed < const Duration(seconds: 10)) {
+        await Future<void>.delayed(const Duration(milliseconds: 400));
+        if (p.state.error.isNotEmpty) break;
+        if (p.state.width > 0) break;
+        if (!mounted) break;
+      }
+      if (p.state.error.isNotEmpty || p.state.width <= 0) {
+        await p.dispose();
+        return false;
+      }
+      if (!mounted) {
+        await p.dispose();
+        return false;
+      }
+      setState(() {
+        _video?.dispose();
+        _video = null;
+        _mp?.dispose();
+        _mp = p;
+        _vc = c;
+        _mode = PlayMode.native;
+        _hint = null;
+      });
+      _timeout?.cancel();
+      return true;
+    } catch (e) {
+      try {
+        await p?.dispose();
+      } catch (_) {}
+      return false;
+    }
+  }
+
+  Future<void> _playNativeVp(String url) async {
     final VideoPlayerController controller = VideoPlayerController.networkUrl(
       Uri.parse(url),
       httpHeaders: <String, String>{
@@ -1205,6 +1329,7 @@ class _PlayerPageState extends State<PlayerPage> {
 
   void _switchToWeb() {
     _video?.pause();
+    _mp?.pause();
     _fallbackToWeb('已切换为网页播放');
   }
 
@@ -1213,6 +1338,7 @@ class _PlayerPageState extends State<PlayerPage> {
     _timeout?.cancel();
     _progress?.cancel();
     _video?.dispose();
+    _mp?.dispose();
     super.dispose();
   }
 
@@ -1240,6 +1366,9 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   Widget _buildNativeArea() {
+    if (_vc != null) {
+      return Video(controller: _vc!);
+    }
     final VideoPlayerController? v = _video;
     if (_mode == PlayMode.resolving || v == null) {
       return Center(
