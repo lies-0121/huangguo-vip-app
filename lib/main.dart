@@ -1202,9 +1202,14 @@ class _PlayerPageState extends State<PlayerPage> {
 
   Future<bool> _playMpv(String url) async {
     Player? p;
+    StreamSubscription<String>? errSub;
+    String mpvErr = '';
     try {
       p = Player();
       final VideoController c = VideoController(p);
+      errSub = p.stream.error.listen((String e) {
+        if (mpvErr.isEmpty) mpvErr = e;
+      });
       await p.open(
         Media(
           url,
@@ -1218,11 +1223,12 @@ class _PlayerPageState extends State<PlayerPage> {
       final Stopwatch sw = Stopwatch()..start();
       while (sw.elapsed < const Duration(seconds: 10)) {
         await Future<void>.delayed(const Duration(milliseconds: 400));
-        if (p.state.error.isNotEmpty) break;
-        if (p.state.width > 0) break;
+        if (mpvErr.isNotEmpty) break;
+        if ((p.state.width ?? 0) > 0) break;
         if (!mounted) break;
       }
-      if (p.state.error.isNotEmpty || p.state.width <= 0) {
+      await errSub.cancel();
+      if (mpvErr.isNotEmpty || (p.state.width ?? 0) <= 0) {
         await p.dispose();
         return false;
       }
