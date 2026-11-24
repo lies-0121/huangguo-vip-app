@@ -49,16 +49,32 @@ jobs:
       - name: Build release APK (flutter)
         id: apk_flutter
         continue-on-error: true
-        run: flutter build apk --release --split-per-abi
+        run: |
+          flutter build apk --release --split-per-abi 2>&1 | tee flutter-build.log || true
+          test -f flutter-build.log && tail -60 flutter-build.log
 
       - name: Build release APK (gradle fallback)
+        id: apk_gradle
         if: steps.apk_flutter.outcome != 'success'
+        continue-on-error: true
         run: |
           echo "flutter.sdk=$FLUTTER_ROOT" > android/local.properties
           cat android/local.properties
           cd android
           chmod +x gradlew
-          ./gradlew assembleRelease --no-daemon --stacktrace
+          (./gradlew assembleRelease --no-daemon --stacktrace 2>&1 | tee ../gradle-build.log) || true
+          tail -120 ../gradle-build.log
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            flutter-build.log
+            gradle-build.log
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Collect APKs
         if: always()
