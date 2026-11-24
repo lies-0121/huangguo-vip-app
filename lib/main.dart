@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -105,8 +106,38 @@ Future<Map<String, dynamic>?> fetchApi(
   }
 }
 
+/// 图片 CDN（七牛）与视频域用的是较新的根证书，旧 Android 系统根库里没有，
+/// 表现就是「浏览器能看图、App 一片灰」。这里只对自家域名放宽校验。
+class LenientHttpOverrides extends HttpOverrides {
+  @override
+  HttpClient createHttpClient(SecurityContext? context) {
+    return super.createHttpClient(context)
+      ..badCertificateCallback = (X509Certificate cert, String host, int port) {
+        const List<String> allow = <String>[
+          'qnlycc.cn',
+          'tjyyjk.cn',
+          'ir95e08v.cc',
+          'huangguoai.com',
+        ];
+        for (final String d in allow) {
+          if (host == d || host.endsWith('.' + d)) return true;
+        }
+        return false;
+      };
+  }
+}
+
+/// 封面图请求头：部分 CDN 会检查 Referer。
+Map<String, String> imgHeaders() {
+  return <String, String>{
+    'User-Agent': kUserAgent,
+    'Referer': gBase + '/',
+  };
+}
+
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  HttpOverrides.global = LenientHttpOverrides();
   await loadBaseOverride();
   runApp(const HuangguoVIPApp());
 }
@@ -469,6 +500,7 @@ class DramaCard extends StatelessWidget {
                       cover,
                       width: double.infinity,
                       fit: BoxFit.cover,
+                      headers: imgHeaders(),
                       errorBuilder:
                           (BuildContext c, Object e, StackTrace? s) => Container(
                         color: Colors.grey[850],
@@ -643,6 +675,7 @@ class _DetailPageState extends State<DetailPage> {
                 : Image.network(
                     cover,
                     fit: BoxFit.cover,
+                    headers: imgHeaders(),
                     errorBuilder: (BuildContext c, Object e, StackTrace? s) =>
                         Container(color: Colors.grey[850]),
                   ),
@@ -764,24 +797,49 @@ class _PlayerPageState extends State<PlayerPage> {
   static const String _jsTemplate = '''
 (function () {
   try {
-    function parseEl(el) {
-      if (!el) return null;
-      try { return JSON.parse(el.textContent || el.innerText || ''); } catch (e) { return null; }
-    }
-    var d = parseEl(document.getElementById('videoInitialData'));
-    if (!d) {
-      var ks = Object.keys(window);
-      for (var i = 0; i < ks.length; i++) {
+    function collect() {
+      var urls = [];
+      var vs = document.querySelectorAll('video');
+      for (var i = 0; i < vs.length; i++) {
+        var s = vs[i].getAttribute('src');
+        if (s) urls.push(s);
+        var ss = vs[i].querySelectorAll('source');
+        for (var j = 0; j < ss.length; j++) {
+          var u = ss[j].getAttribute('src');
+          if (u) urls.push(u);
+        }
+      }
+      for (var k = 0; k < urls.length; k++) {
+        if (urls[k].indexOf('http') === 0) return urls[k];
+      }
+      var html = document.documentElement.outerHTML || '';
+      var at = html.indexOf('.m3u8');
+      if (at > 0) {
+        var start = html.lastIndexOf('http', at);
+        var end = at + 5;
+        var stop = ['"', "'", ' ', '>', '<'];
+        while (end < html.length && stop.indexOf(html.charAt(end)) < 0) end++;
+        var cut = html.substring(start, end).split('&amp;').join('&');
+        if (cut.indexOf('http') === 0) return cut;
+      }
+      var el = document.getElementById('videoInitialData');
+      if (el) {
         try {
-          var v = window[ks[i]];
-          if (v && typeof v === 'object' && v.epPlaySrcs) { d = v; break; }
+          var d = JSON.parse(el.textContent || '');
+          var srcs = d.epPlaySrcs || (d.data && d.data.epPlaySrcs);
+          if (srcs) {
+            var ks = Object.keys(srcs);
+            for (var m = 0; m < ks.length; m++) {
+              var v = srcs[ks[m]];
+              if (v && typeof v === 'object') v = v.url || v.src || v.m3u8;
+              if (typeof v === 'string' && v.indexOf('http') === 0) return v;
+            }
+          }
         } catch (e) {}
       }
+      return '';
     }
-    if (!d) return '';
-    var srcs = d.epPlaySrcs || (d.data && d.data.epPlaySrcs) || null;
-    if (!srcs) return '';
-    return JSON.stringify(srcs);
+    return collect();
   } catch (e) { return ''; }
 })()
 ''';
@@ -804,7 +862,11 @@ class _PlayerPageState extends State<PlayerPage> {
       ..setNavigationDelegate(
         NavigationDelegate(
           onPageFinished: (String url) async {
-            await _tryExtract();
+            for (int i = 0; i < 3; i++) {
+              await _tryExtract();
+              if (_resolved) return;
+              await Future<void>.delayed(const Duration(milliseconds: 1500));
+            }
           },
           onWebResourceError: (WebResourceError error) {
             if (!mounted || _resolved) return;
@@ -813,7 +875,14 @@ class _PlayerPageState extends State<PlayerPage> {
         ),
       )
       ..loadRequest(
-        Uri.parse(gBase + '/video/' + widget.dramaId.toString() + '/'),
+        Uri.parse(
+          gBase +
+              '/video/' +
+              widget.dramaId.toString() +
+              '/ep-' +
+              widget.episode.toString() +
+              '/',
+        ),
       );
 
     _timeout = Timer(const Duration(seconds: 20), _fallbackToWeb);
@@ -877,6 +946,11 @@ class _PlayerPageState extends State<PlayerPage> {
       final Object raw = await _web.runJavaScriptReturningResult(_extractJs);
       final String text = _unwrapRaw(raw);
       if (text.isEmpty) return;
+      if (text.startsWith('http')) {
+        _resolved = true;
+        await _playNative(text);
+        return;
+      }
       dynamic parsed;
       try {
         parsed = json.decode(text);
