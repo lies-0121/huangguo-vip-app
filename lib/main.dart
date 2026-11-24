@@ -60,6 +60,7 @@ const String kUserAgent =
     '(KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1';
 
 const int kHttpTimeout = 12;
+const String kAppVer = 'v1.1d';
 
 int intOf(dynamic v, [int fallback = 0]) {
   if (v is int) return v;
@@ -128,6 +129,101 @@ class LenientHttpOverrides extends HttpOverrides {
 }
 
 /// 封面图请求头：部分 CDN 会检查 Referer。
+
+class CoverImage extends StatefulWidget {
+  const CoverImage({
+    super.key,
+    required this.url,
+    this.fit = BoxFit.cover,
+    this.width,
+    this.placeholder,
+  });
+
+  final String url;
+  final BoxFit fit;
+  final double? width;
+  final Widget? placeholder;
+
+  @override
+  State<CoverImage> createState() => CoverImageState();
+}
+
+class CoverImageState extends State<CoverImage> {
+  String _url = '';
+  bool _switched = false;
+  String _err = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _url = widget.url;
+  }
+
+  @override
+  void didUpdateWidget(CoverImage old) {
+    super.didUpdateWidget(old);
+    if (old.url != widget.url) {
+      _url = widget.url;
+      _switched = false;
+      _err = '';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_url.isEmpty) {
+      return Container(
+        color: Colors.grey[850],
+        child: Center(child: widget.placeholder ?? const Icon(Icons.movie)),
+      );
+    }
+    return Image.network(
+      _url,
+      width: widget.width ?? double.infinity,
+      fit: widget.fit,
+      headers: imgHeaders(),
+      errorBuilder: (BuildContext c, Object e, StackTrace? s) {
+        if (!_switched && _url.startsWith('https://')) {
+          _switched = true;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted) {
+              setState(() {
+                _url = 'http://' + _url.substring(8);
+              });
+            }
+          });
+          return Container(color: Colors.grey[850]);
+        }
+        final String msg = e.toString();
+        final int cut = msg.indexOf('\n');
+        final String short = cut > 0 ? msg.substring(0, cut) : msg;
+        if (_err != short) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted && _err != short) {
+              setState(() {
+                _err = short;
+              });
+            }
+          });
+        }
+        return Container(
+          color: Colors.grey[850],
+          padding: const EdgeInsets.all(4),
+          child: Center(
+            child: Text(
+              _err.isEmpty ? '封面加载失败' : _err,
+              maxLines: 4,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 8, color: Colors.white70),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
 Map<String, String> imgHeaders() {
   return <String, String>{
     'User-Agent': kUserAgent,
@@ -259,7 +355,7 @@ class _HomePageState extends State<HomePage> {
       appBar: AppBar(
         title: Row(
           children: <Widget>[
-            const Text('黄果短剧'),
+            Text('黄果短剧 ' + kAppVer),
             if (_isVIP)
               Container(
                 margin: const EdgeInsets.only(left: 8),
@@ -491,22 +587,12 @@ class DramaCard extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: <Widget>[
             Expanded(
-              child: cover.isEmpty
-                  ? Container(
-                      color: Colors.grey[850],
-                      child: const Icon(Icons.movie),
-                    )
-                  : Image.network(
-                      cover,
-                      width: double.infinity,
-                      fit: BoxFit.cover,
-                      headers: imgHeaders(),
-                      errorBuilder:
-                          (BuildContext c, Object e, StackTrace? s) => Container(
-                        color: Colors.grey[850],
-                        child: const Center(child: Icon(Icons.broken_image)),
-                      ),
-                    ),
+              child: CoverImage(
+                url: cover,
+                width: double.infinity,
+                fit: BoxFit.cover,
+                placeholder: const Icon(Icons.movie),
+              ),
             ),
             Padding(
               padding: const EdgeInsets.all(6),
@@ -670,15 +756,7 @@ class _DetailPageState extends State<DetailPage> {
         children: <Widget>[
           AspectRatio(
             aspectRatio: 16 / 9,
-            child: cover.isEmpty
-                ? Container(color: Colors.grey[850])
-                : Image.network(
-                    cover,
-                    fit: BoxFit.cover,
-                    headers: imgHeaders(),
-                    errorBuilder: (BuildContext c, Object e, StackTrace? s) =>
-                        Container(color: Colors.grey[850]),
-                  ),
+            child: CoverImage(url: cover, fit: BoxFit.cover),
           ),
           Padding(
             padding: const EdgeInsets.all(16),
@@ -798,6 +876,17 @@ class _PlayerPageState extends State<PlayerPage> {
 (function () {
   try {
     function collect() {
+      try {
+        var ps = document.querySelectorAll('video');
+        for (var p = 0; p < ps.length; p++) {
+          try { ps[p].click(); } catch (e1) {}
+          try { ps[p].muted = true; ps[p].play(); } catch (e2) {}
+        }
+        var bs = document.querySelectorAll('[class*="play-btn"], [class*="playBtn"], .xgplayer-start');
+        for (var b = 0; b < bs.length && b < 2; b++) {
+          try { bs[b].click(); } catch (e3) {}
+        }
+      } catch (e0) {}
       var urls = [];
       var vs = document.querySelectorAll('video');
       for (var i = 0; i < vs.length; i++) {
@@ -812,6 +901,13 @@ class _PlayerPageState extends State<PlayerPage> {
       for (var k = 0; k < urls.length; k++) {
         if (urls[k].indexOf('http') === 0) return urls[k];
       }
+      try {
+        var rs = performance.getEntriesByType('resource');
+        for (var q = 0; q < rs.length; q++) {
+          var nm = rs[q].name || '';
+          if (nm.indexOf('.m3u8') >= 0 && nm.indexOf('http') === 0) return nm;
+        }
+      } catch (e) {}
       var html = document.documentElement.outerHTML || '';
       var at = html.indexOf('.m3u8');
       if (at > 0) {
@@ -851,6 +947,8 @@ class _PlayerPageState extends State<PlayerPage> {
   String? _hint;
   Timer? _timeout;
   Timer? _progress;
+  int _tries = 0;
+  String _diag = '';
 
   @override
   void initState() {
@@ -861,11 +959,21 @@ class _PlayerPageState extends State<PlayerPage> {
       ..setUserAgent(kUserAgent)
       ..setNavigationDelegate(
         NavigationDelegate(
+          onPageStarted: (String url) {
+            if (mounted) {
+              setState(() {
+                _diag = '页面开始加载';
+              });
+            }
+          },
           onPageFinished: (String url) async {
-            for (int i = 0; i < 3; i++) {
+            for (int i = 0; i < 12; i++) {
               await _tryExtract();
               if (_resolved) return;
-              await Future<void>.delayed(const Duration(milliseconds: 1500));
+              await Future<void>.delayed(const Duration(milliseconds: 1600));
+            }
+            if (!_resolved && mounted) {
+              await _noteDiag('12 次重试均失败');
             }
           },
           onWebResourceError: (WebResourceError error) {
@@ -885,7 +993,9 @@ class _PlayerPageState extends State<PlayerPage> {
         ),
       );
 
-    _timeout = Timer(const Duration(seconds: 20), _fallbackToWeb);
+    _timeout = Timer(const Duration(seconds: 30), () {
+      _fallbackToWeb('30 秒内未取到播放地址');
+    });
   }
 
   String get _extractJs => _jsTemplate;
@@ -942,10 +1052,14 @@ class _PlayerPageState extends State<PlayerPage> {
 
   Future<void> _tryExtract() async {
     if (_resolved || !mounted) return;
+    _tries += 1;
     try {
       final Object raw = await _web.runJavaScriptReturningResult(_extractJs);
       final String text = _unwrapRaw(raw);
-      if (text.isEmpty) return;
+      if (text.isEmpty) {
+        await _noteDiag('第 ' + _tries.toString() + ' 次：页面没有给出地址');
+        return;
+      }
       if (text.startsWith('http')) {
         _resolved = true;
         await _playNative(text);
@@ -958,22 +1072,75 @@ class _PlayerPageState extends State<PlayerPage> {
         parsed = text;
       }
       final String url = _pickUrl(parsed, widget.episode);
-      if (url.isEmpty) return;
+      if (url.isEmpty) {
+        await _noteDiag('第 ' + _tries.toString() + ' 次：返回了但挑不出本集地址');
+        return;
+      }
       _resolved = true;
       await _playNative(url);
-    } catch (_) {
-      // 风控挑战页 / 跨域限制时静默重试，交给超时兜底
+    } catch (e) {
+      final String m = e.toString();
+      final int cut = m.indexOf('\n');
+      await _noteDiag(
+        '第 ' + _tries.toString() + ' 次异常：' + (cut > 0 ? m.substring(0, cut) : m),
+      );
+    }
+  }
+
+  /// 记录一次失败现场：页面标题、video/source 数量、videoInitialData 里几集有源。
+  Future<void> _noteDiag(String head) async {
+    final String probe = await _probePage();
+    if (!mounted) return;
+    setState(() {
+      _diag = head + '｜' + probe;
+    });
+  }
+
+  Future<String> _probePage() async {
+    const String js = '''
+(function () {
+  try {
+    var t = (document.title || '').slice(0, 24);
+    var v = document.querySelectorAll('video').length;
+    var s = document.querySelectorAll('source').length;
+    var n = -1;
+    var el = document.getElementById('videoInitialData');
+    if (el && el.textContent) {
+      var d = JSON.parse(el.textContent);
+      if (d.epPlaySrcs) n = Object.keys(d.epPlaySrcs).length;
+    }
+    var html = document.documentElement.outerHTML || '';
+    var hit = html.indexOf('.m3u8') >= 0 ? 1 : 0;
+    return 'title=' + t + ' video=' + v + ' source=' + s + ' eps=' + n + ' htmlM3u8=' + hit;
+  } catch (e) {
+    return 'probe-error ' + e;
+  }
+})()
+''';
+    try {
+      final Object raw = await _web.runJavaScriptReturningResult(js);
+      return _unwrapRaw(raw);
+    } catch (e) {
+      return 'probe-fail';
     }
   }
 
   Future<void> _playNative(String url) async {
-    final VideoPlayerController controller =
-        VideoPlayerController.networkUrl(Uri.parse(url));
+    final VideoPlayerController controller = VideoPlayerController.networkUrl(
+      Uri.parse(url),
+      httpHeaders: <String, String>{
+        'User-Agent': kUserAgent,
+        'Referer': gBase + '/',
+        'Accept': '*/*',
+      },
+    );
     try {
       await controller.initialize();
-    } catch (_) {
+    } catch (e) {
+      final String m = e.toString();
+      final int cut = m.indexOf('\n');
       await controller.dispose();
-      _fallbackToWeb('播放器初始化失败，已切到网页播放');
+      _fallbackToWeb('播放器初始化失败：' + (cut > 0 ? m.substring(0, cut) : m));
       return;
     }
     if (!mounted) {
@@ -1090,6 +1257,17 @@ class _PlayerPageState extends State<PlayerPage> {
                   _hint!,
                   textAlign: TextAlign.center,
                   style: const TextStyle(fontSize: 12, color: Colors.grey),
+                ),
+              ),
+            ],
+            if (_diag.isNotEmpty) ...<Widget>[
+              const SizedBox(height: 12),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 20),
+                child: Text(
+                  _diag,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(fontSize: 10, color: Colors.orange),
                 ),
               ),
             ],
