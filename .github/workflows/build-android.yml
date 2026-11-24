@@ -11,46 +11,68 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
           distribution: zulu
           java-version: '17'
 
-      - uses: subosito/flutter-action@v2
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.24.5'
           channel: stable
           cache: true
 
-      # 兜底：即使 main/AndroidManifest.xml 没被替换，也把权限与明文流量补上
       - name: Patch AndroidManifest
         run: |
           F=android/app/src/main/AndroidManifest.xml
-          grep -q 'android.permission.INTERNET' "$F" || sed -i 's#</manifest>#    <uses-permission android:name="android.permission.INTERNET"/>\n</manifest>#' "$F"
-          grep -q 'usesCleartextTraffic' "$F" || sed -i 's#<application#<application android:usesCleartextTraffic="true"#' "$F"
-          grep -n 'INTERNET' "$F"
+          grep -q 'android.permission.INTERNET' "$F" || sed -i 's|<application|<uses-permission android:name="android.permission.INTERNET" />\n    <application|' "$F"
+          grep -q 'usesCleartextTraffic' "$F" || sed -i 's|<application|<application android:usesCleartextTraffic="true"|' "$F"
+          echo '--- manifest ---'
+          head -40 "$F"
 
       - name: Report signing mode
         run: |
           if [ -f android/key.properties ] && [ -f android/app/huangguo.jks ]; then
-            echo "签名：固定 key（huangguo.jks），可直接覆盖安装"
+            echo "签名: 固定 key (huangguo.jks) - 可直接覆盖安装"
           else
-            echo "签名：debug key（每次构建指纹不同，升级需先卸载）"
-            echo "想固定签名：先跑一次 Generate signing keystore 工作流，把产物按原路径提交进仓库"
+            echo "签名: debug key - 每次构建指纹不同, 覆盖安装需先卸载旧版"
           fi
 
-      # 仓库里提交了旧版 Flutter 生成的插件清单，会让 pub get 用到过期依赖
       - name: Drop stale plugin metadata
         run: rm -f .flutter-plugins .flutter-plugins-dependencies
 
       - name: Pub get
         run: flutter pub get
 
-      - name: Build release APK
+      - name: Build release APK (flutter)
+        id: apk_flutter
+        continue-on-error: true
         run: flutter build apk --release --split-per-abi
 
-      - uses: actions/upload-artifact@v4
+      - name: Build release APK (gradle fallback)
+        if: steps.apk_flutter.outcome != 'success'
+        run: |
+          echo "flutter.sdk=$FLUTTER_ROOT" > android/local.properties
+          cat android/local.properties
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Collect APKs
+        if: always()
+        run: |
+          echo '--- apk files ---'
+          find . -name '*.apk' -type f -not -path '*/intermediates/*' | head -20
+
+      - name: Upload APK
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: huangguo-apk
-          path: build/app/outputs/flutter-apk/*.apk
+          path: |
+            build/app/outputs/flutter-apk/*.apk
+            android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: warn
           retention-days: 30
